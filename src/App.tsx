@@ -7,6 +7,7 @@ import {
 } from "esptool-js";
 import { useRef, useState } from "preact/hooks";
 import { serial } from "web-serial-polyfill";
+import tDisplays3releases from "./firmwares/dashboard-lilygo-t-displays3-releases.json";
 
 function useSerialConnection(baudrate: string) {
 	const [isConnected, setIsConnected] = useState(false);
@@ -19,7 +20,8 @@ function useSerialConnection(baudrate: string) {
 	const writerRef = useRef<WritableStreamDefaultWriter | null>(null);
 	const readerRef = useRef<ReadableStreamDefaultReader | null>(null);
 
-	const serialLib = !navigator.serial && (navigator as any).usb ? serial : navigator.serial;
+	const serialLib =
+		!navigator.serial && (navigator as any).usb ? serial : navigator.serial;
 
 	const terminal = {
 		clean() {},
@@ -96,7 +98,7 @@ function useSerialConnection(baudrate: string) {
 		}
 
 		const encoder = new TextEncoder();
-		await writerRef.current.write(encoder.encode(command + "\n"));
+		await writerRef.current.write(encoder.encode(`${command}\n`));
 
 		let response = "";
 		const decoder = new TextDecoder();
@@ -106,8 +108,10 @@ function useSerialConnection(baudrate: string) {
 		while (Date.now() - startTime < timeout) {
 			try {
 				const readPromise = readerRef.current.read();
-				const timeoutPromise = new Promise<ReadableStreamReadResult<Uint8Array>>(
-					(_, reject) => setTimeout(() => reject(new Error("Read timeout")), 1000)
+				const timeoutPromise = new Promise<
+					ReadableStreamReadResult<Uint8Array>
+				>((_, reject) =>
+					setTimeout(() => reject(new Error("Read timeout")), 1000),
 				);
 
 				const result = await Promise.race([readPromise, timeoutPromise]);
@@ -115,10 +119,7 @@ function useSerialConnection(baudrate: string) {
 					const chunk = decoder.decode(result.value);
 					response += chunk;
 
-					if (
-						response.includes("END") ||
-						response.includes("ERROR")
-					) {
+					if (response.includes("END") || response.includes("ERROR")) {
 						break;
 					}
 				}
@@ -172,7 +173,7 @@ function useFlashOperations(serial: ReturnType<typeof useSerialConnection>) {
 			await serial.setupESPTool();
 
 			await serial.espLoaderRef.current?.writeFlash({
-				fileArray: [{ data: fileData, address: 0x0 }],
+				fileArray: [{ data: fileData, address: 0x10000 }],
 				flashSize: "keep",
 				flashMode: "keep",
 				flashFreq: "keep",
@@ -235,7 +236,9 @@ function usePreferences(serial: ReturnType<typeof useSerialConnection>) {
 		setIsUpdatingPrefs(true);
 		try {
 			const prefsData = JSON.parse(preferences);
-			const response = await serial.sendCommand(`SET_ALL_PREFS:${JSON.stringify(prefsData)}`);
+			const response = await serial.sendCommand(
+				`SET_ALL_PREFS:${JSON.stringify(prefsData)}`,
+			);
 			if (response.includes("ERROR")) {
 				throw new Error(`Update failed: ${response}`);
 			}
@@ -255,21 +258,56 @@ function usePreferences(serial: ReturnType<typeof useSerialConnection>) {
 	};
 }
 
-function useFileHandler() {
-	const [file, setFile] = useState<File | null>(null);
-	const [fileData, setFileData] = useState<string | null>(null);
+function useFirmwareLoader() {
+	const [selectedVersion, setSelectedVersion] = useState<string>("");
+	const [firmwareData, setFirmwareData] = useState<string | null>(null);
+	const [isLoadingFirmware, setIsLoadingFirmware] = useState(false);
 
-	const handleFileSelect = (event: Event) => {
-		const selectedFile = (event.target as HTMLInputElement).files?.[0];
-		if (!selectedFile) return;
+	const loadFirmware = async (version: string) => {
+		if (!version) {
+			throw new Error("No version selected");
+		}
 
-		setFile(selectedFile);
-		const reader = new FileReader();
-		reader.onload = (ev) => setFileData(ev.target?.result as string);
-		reader.readAsBinaryString(selectedFile);
+		setIsLoadingFirmware(true);
+		try {
+			const firmwarePath = `./firmwares/${version}/dashboard-lilygo-t-displays3.bin`;
+			const response = await fetch(firmwarePath);
+
+			if (!response.ok) {
+				throw new Error(
+					`Failed to load firmware: ${response.status} ${response.statusText}`,
+				);
+			}
+
+			const arrayBuffer = await response.arrayBuffer();
+			const uint8Array = new Uint8Array(arrayBuffer);
+			let binaryString = "";
+			for (let i = 0; i < uint8Array.length; i++) {
+				binaryString += String.fromCharCode(uint8Array[i]);
+			}
+
+			setFirmwareData(binaryString);
+			return binaryString;
+		} finally {
+			setIsLoadingFirmware(false);
+		}
 	};
 
-	return { file, fileData, handleFileSelect };
+	const handleVersionChange = async (version: string) => {
+		setSelectedVersion(version);
+		setFirmwareData(null);
+		if (version) {
+			await loadFirmware(version);
+		}
+	};
+
+	return {
+		selectedVersion,
+		firmwareData,
+		isLoadingFirmware,
+		loadFirmware,
+		handleVersionChange,
+	};
 }
 
 function useErrorHandler() {
@@ -294,7 +332,7 @@ export function App() {
 	const serial = useSerialConnection(baudrate);
 	const flash = useFlashOperations(serial);
 	const preferences = usePreferences(serial);
-	const fileHandler = useFileHandler();
+	const firmware = useFirmwareLoader();
 
 	const handleConnect = async () => {
 		try {
@@ -319,14 +357,17 @@ export function App() {
 	};
 
 	const handleProgram = async () => {
-		if (!fileHandler.fileData) {
-			handleError(new Error("No file selected!"), "Programming failed");
+		if (!firmware.firmwareData) {
+			handleError(
+				new Error("No firmware loaded! Please select a version first."),
+				"Programming failed",
+			);
 			return;
 		}
 
 		try {
 			clearAlert();
-			await flash.programFlash(fileHandler.fileData);
+			await flash.programFlash(firmware.firmwareData);
 			setAlert("Programming completed successfully!");
 		} catch (e: any) {
 			handleError(e, "Programming failed");
@@ -352,14 +393,27 @@ export function App() {
 		}
 	};
 
+	const handleVersionSelect = async (event: Event) => {
+		const version = (event.target as HTMLSelectElement).value;
+		try {
+			clearAlert();
+			await firmware.handleVersionChange(version);
+		} catch (error: any) {
+			handleError(error, "Failed to load firmware");
+		}
+	};
+
 	return (
 		<div>
-			<h3>ESP Programmer</h3>
+			<h3>Flasher</h3>
 
 			{!serial.isConnected ? (
 				<div>
 					<label>Baudrate: </label>
-					<select value={baudrate} onChange={(e) => setBaudrate((e.target as HTMLSelectElement).value)}>
+					<select
+						value={baudrate}
+						onChange={(e) => setBaudrate((e.target as HTMLSelectElement).value)}
+					>
 						<option value="921600">921600</option>
 						<option value="460800">460800</option>
 						<option value="230400">230400</option>
@@ -387,8 +441,21 @@ export function App() {
 			{serial.isConnected && !flash.isErasing && (
 				<div>
 					<div>
-						<label>Firmware File: </label>
-						<input type="file" onChange={fileHandler.handleFileSelect} accept=".bin" />
+						<label>Firmware Version: </label>
+						<select
+							value={firmware.selectedVersion}
+							onChange={handleVersionSelect}
+							disabled={firmware.isLoadingFirmware}
+						>
+							<option value="">Select firmware version...</option>
+							{tDisplays3releases.map((release) => (
+								<option key={release.version} value={release.version}>
+									{release.version}
+								</option>
+							))}
+						</select>
+						{firmware.isLoadingFirmware && <span> Loading firmware...</span>}
+						{firmware.firmwareData && <span> ✓ Firmware loaded</span>}
 					</div>
 
 					{flash.isProgramming && (
@@ -398,7 +465,14 @@ export function App() {
 						</div>
 					)}
 
-					<button onClick={handleProgram} disabled={flash.isProgramming || !fileHandler.file}>
+					<button
+						onClick={handleProgram}
+						disabled={
+							flash.isProgramming ||
+							!firmware.firmwareData ||
+							firmware.isLoadingFirmware
+						}
+					>
 						{flash.isProgramming ? "Programming..." : "Program"}
 					</button>
 
@@ -409,21 +483,33 @@ export function App() {
 					<div>
 						<button
 							onClick={handleGetAllSettings}
-							disabled={preferences.isLoadingPrefs || preferences.isUpdatingPrefs}
+							disabled={
+								preferences.isLoadingPrefs || preferences.isUpdatingPrefs
+							}
 						>
 							{preferences.isLoadingPrefs ? "Loading..." : "Get All Settings"}
 						</button>
 
 						<button
 							onClick={handleUpdateAllSettings}
-							disabled={preferences.isLoadingPrefs || preferences.isUpdatingPrefs || !preferences.preferences.trim()}
+							disabled={
+								preferences.isLoadingPrefs ||
+								preferences.isUpdatingPrefs ||
+								!preferences.preferences.trim()
+							}
 						>
-							{preferences.isUpdatingPrefs ? "Updating..." : "Update All Settings"}
+							{preferences.isUpdatingPrefs
+								? "Updating..."
+								: "Update All Settings"}
 						</button>
 
 						<button
-							onClick={async () => preferences.setPreferences(await serial.sendCommand("PING"))}
-							disabled={preferences.isLoadingPrefs || preferences.isUpdatingPrefs}
+							onClick={async () =>
+								preferences.setPreferences(await serial.sendCommand("PING"))
+							}
+							disabled={
+								preferences.isLoadingPrefs || preferences.isUpdatingPrefs
+							}
 						>
 							PING
 						</button>
@@ -431,7 +517,11 @@ export function App() {
 
 					<textarea
 						value={preferences.preferences}
-						onChange={(e) => preferences.setPreferences((e.target as HTMLTextAreaElement).value)}
+						onChange={(e) =>
+							preferences.setPreferences(
+								(e.target as HTMLTextAreaElement).value,
+							)
+						}
 						placeholder="Device preferences will appear here..."
 						rows={15}
 						cols={80}
